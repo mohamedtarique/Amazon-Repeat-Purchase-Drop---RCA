@@ -432,7 +432,6 @@ Analysis showed that customers aged 18–34 accounted for the majority of repeat
 
 These customers are:
 
-- Highly mobile-first
 - More likely to adopt convenience services
 - More sensitive to delivery speed
 
@@ -442,17 +441,6 @@ Younger customers demonstrate lower tolerance for longer delivery promises.
 
 ---
 
-## Tier-1 vs Tier-2 Comparison
-
-Approximately 80% of the decline originated from Tier-1 cities.
-
-Historically, repeat purchase changes were distributed across Tier-2 and Tier-3 regions.
-
-### Conclusion
-
-The concentration of decline in Tier-1 cities strongly aligns with Quick Commerce penetration patterns.
-
----
 
 ## Grocery and Beauty Category Comparison
 
