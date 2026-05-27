@@ -1,0 +1,553 @@
+-- Adding Quarter as a column
+-- 1. Add and populate qtr for orders
+ALTER TABLE orders ADD COLUMN qtr INT;
+UPDATE orders SET qtr = EXTRACT(QUARTER FROM order_date);
+
+-- 2. Add and populate qtr for user_events (Required for your joins)
+ALTER TABLE user_events ADD COLUMN qtr INT;
+UPDATE user_events SET qtr = EXTRACT(QUARTER FROM event_date);
+
+--1) QoQ Repeat purchase
+-- (1 purchase in a quarter not same day purchase)
+
+WITH repeat_customers AS
+(SELECT qtr, COUNT(customer_id) AS rp_cust
+FROM
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) > 1)
+GROUP BY 1),
+total_customers AS
+(SELECT qtr, COUNT(customer_id) AS ttl_cust
+FROM
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2)
+GROUP BY 1)
+SELECT t1.qtr, ROUND(100.0*t1.rp_cust/t2.ttl_cust,2) AS repeat_customers
+FROM repeat_customers AS t1
+JOIN total_customers AS t2
+ON t1.qtr = t2.qtr;
+
+
+--2) Quality of customers
+WITH t1 AS (SELECT 
+	order_channel,
+	COUNT(CASE WHEN qtr = 1 THEN order_id END) AS Q1,
+	COUNT(CASE WHEN qtr = 2 THEN order_id END) AS Q2,
+	COUNT(CASE WHEN qtr = 3 THEN order_id END) AS Q3
+FROM orders
+GROUP BY 1
+)
+SELECT 
+	order_channel, 
+	ROUND(Q1*100.0/SUM(Q1) OVER(),2) AS Q1,
+	ROUND(Q2*100.0/SUM(Q2) OVER(),2) AS Q2,
+	ROUND(Q3*100.0/SUM(Q3) OVER(),2) AS Q3
+FROM t1;
+
+--3) Does users Active after their first purchase
+-- user with no second purchase
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+active_customers_after_purchase AS
+(SELECT t1.qtr, t1.customer_id, t2.event_type, t2.source, t1.order_date, t2.event_date 
+FROM non_repeat_customers_by_date AS t1
+JOIN user_events AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.user_id
+AND t1.order_date < t2.event_date
+WHERE event_type = 'home_page')
+SELECT 
+	t1.qtr, ROUND(100.0*total_active_customers/total_customers,2) AS percentage_of_active_customers
+FROM
+	(SELECT qtr, COUNT(customer_id) AS total_customers
+	FROM non_repeat_customers_by_date
+	GROUP BY 1) AS t1
+JOIN 
+	(SELECT qtr, COUNT(customer_id) AS total_active_customers
+	FROM active_customers_after_purchase
+	GROUP BY 1) AS t2 
+ON t1.qtr = t2.qtr
+ORDER BY 1;
+
+--4) is there any change in active user quality
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, t2.order_channel, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+active_customers_after_purchase_by_source AS
+(SELECT t1.qtr, t1.customer_id, t2.event_type, t1.order_channel, t1.order_date, t2.event_date 
+FROM non_repeat_customers_by_date AS t1
+JOIN user_events AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.user_id
+AND t1.order_date < t2.event_date
+WHERE event_type = 'home_page')
+SELECT 
+order_channel,
+ROUND((100*qtr1/SUM(qtr1) OVER()),2) qtr1,
+ROUND((100*qtr2/SUM(qtr2) OVER()),2) qtr2,
+ROUND((100*qtr3/SUM(qtr3) OVER()),2) qtr3
+FROM
+	(SELECT 
+		order_channel, 
+		COUNT(CASE WHEN qtr = 1 THEN 1 END) AS qtr1,
+		COUNT(CASE WHEN qtr = 2 THEN 1 END) AS qtr2,
+		COUNT(CASE WHEN qtr = 3 THEN 1 END) AS qtr3
+	FROM 
+		active_customers_after_purchase_by_source
+	GROUP BY 1);
+
+--5) i) Does these customers dropping because of missed SLA or issue with product
+WITH delivery_SLA AS
+(SELECT t1.qtr, t1.customer_id, DATE(delivery_date) - DATE(estimated_delivery_date) AS SLA
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id)
+SELECT
+qtr, 
+ROUND(100.0*Delivery_as_per_sla/total_sla,2) AS Delivery_as_per_sla,
+ROUND(100.0*missed_sla/total_sla,2) AS missed_sla,
+ROUND(100.0*Delivery_before_sla/total_sla,2) AS Delivery_before_sla
+FROM
+(SELECT
+	qtr,
+	COUNT(CASE WHEN sla = 0 THEN 1 END) AS Delivery_as_per_sla,
+	COUNT(CASE WHEN sla < 0 THEN 1 END) AS missed_sla,
+	COUNT(CASE WHEN sla > 0 THEN 1 END) AS Delivery_before_sla,
+	COUNT(sla) AS total_SLA
+FROM delivery_SLA
+GROUP BY 1);
+
+--5) ii) Is there any compliant or negative feedback on Delivery/Product 
+-- negative feedback (lesser than  3)
+WITH non_repeat_customers AS
+(SELECT t1.qtr, t1.customer_id, t2.order_id
+FROM
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2 
+ON t1.customer_id = t2.customer_id
+AND t1.qtr = t2.qtr),
+first_purchase_review AS
+(SELECT t2.qtr, t2.customer_id, t2.order_id, t1.rating
+FROM product_reviews AS t1
+JOIN non_repeat_customers AS t2
+ON t1.order_id = t2.order_id)
+SELECT 
+	t1.qtr, 
+	ROUND(100*Negative_reviews/total_order_by_non_rep_cust,2) AS Negative_reviews,
+	ROUND(100*Neutral_reviews/total_order_by_non_rep_cust,2) AS Neutral_reviews,
+	ROUND(100*Positive_reviews/total_order_by_non_rep_cust,2) AS Positive_reviews,
+	ROUND(100*(Negative_reviews+Neutral_reviews+Positive_reviews)/total_order_by_non_rep_cust,2) AS no_reviews
+FROM
+(SELECT qtr, COUNT(order_id) AS total_order_by_non_rep_cust
+FROM non_repeat_customers
+GROUP BY 1) AS t1
+JOIN 
+(SELECT 
+	qtr, 
+	COUNT(CASE WHEN rating <=2 THEN 1 END) AS Negative_reviews,
+	COUNT(CASE WHEN rating =3 THEN 1 END) AS Neutral_reviews,
+	COUNT(CASE WHEN rating >3 THEN 1 END) AS Positive_reviews,
+	COUNT(rating) AS total_reviews  
+FROM first_purchase_review
+GROUP BY 1) AS t2
+ON t1.qtr = t2.qtr;
+
+
+--5) iii) customer compliant from non repeat customers from their first order
+WITH non_repeat_customers AS
+(SELECT t1.qtr, t1.customer_id, t2.order_id
+FROM
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2 
+ON t1.customer_id = t2.customer_id
+AND t1.qtr = t2.qtr)
+SELECT t1.qtr, ROUND(100*total_customer_compliant/total_order_by_non_rep_cust,2) as total_complaints
+FROM
+	(SELECT qtr, COUNT(order_id) AS total_order_by_non_rep_cust
+	FROM non_repeat_customers
+	GROUP BY 1) AS t1
+JOIN
+	(SELECT t1.qtr, COUNT(ticket_id) AS total_customer_compliant	
+	FROM non_repeat_customers AS t1
+	JOIN cs_support AS t2
+	ON t1.customer_id = t2.customer_id
+	AND t1.order_id = t2.order_id
+	GROUP BY 1) AS t2
+ON t1.qtr = t2.qtr
+ORDER BY 1;
+
+-- 5) iv) is the return of the first order of these non customers return has increased?
+
+WITH non_repeat_customers AS
+(SELECT t1.qtr, t1.customer_id, t2.order_id
+FROM
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2 
+ON t1.customer_id = t2.customer_id
+AND t1.qtr = t2.qtr),
+non_repeat_customers_retunrs AS
+(SELECT t1.order_id, t1.customer_id, return_id
+FROM returns AS t1
+JOIN non_repeat_customers AS t2
+ON t1.customer_id = t2.customer_id
+AND t1.order_id = t2.order_id)
+SELECT t1.qtr, ROUND(100*total_non_rep_returns/total_order_by_non_rep_cust,2) total_returns
+FROM
+	(SELECT qtr, COUNT(order_id) AS total_order_by_non_rep_cust
+	FROM non_repeat_customers
+	GROUP BY 1) AS t1
+JOIN
+	(SELECT t1.qtr, COUNT(t1) AS total_non_rep_returns	
+	FROM non_repeat_customers AS t1
+	JOIN non_repeat_customers_retunrs AS t2
+	ON t1.customer_id = t2.customer_id
+	AND t1.order_id = t2.order_id
+	GROUP BY 1) AS t2
+ON t1.qtr = t2.qtr
+ORDER BY 1;
+
+--6) non_repeat_customers_funnel_analysis
+--i) Funnel path Analysis
+
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+funnel_path_analysis AS
+(SELECT t1.qtr, 
+SUM(CASE WHEN event_type = 'browse_category' THEN 1 END) AS browse,
+SUM(CASE WHEN event_type = 'search' THEN 1 END) AS searches,
+COUNT(*) FILTER(WHERE event_type IN ('browse_category', 'search' )) AS total
+FROM user_events AS t1
+JOIN non_repeat_customers_by_date AS t2 
+ON t1.user_id = t2.customer_id
+AND t1.qtr = t2.qtr
+AND t1.event_date > t2.order_date
+GROUP BY 1)
+SELECT qtr, ROUND(100*browse/total,2) AS browse, ROUND(100*searches/total,2) AS searches
+FROM funnel_path_analysis;
+
+--ii) Funnel Analysis
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+non_rep_customers_events AS
+(SELECT t1.*, t2.customer_id, t2.order_date 
+FROM user_events AS t1
+JOIN non_repeat_customers_by_date AS t2
+ON t1.user_id = t2.customer_id
+AND t1.qtr = t2.qtr
+AND t1.event_date > t2.order_date),
+event_lable AS
+(SELECT session_id, 
+CASE 
+	WHEN event_type = 'browse_category' THEN 'Browse'
+	WHEN event_type = 'search' THEN 'Search'
+END AS path_type
+FROM non_rep_customers_events
+WHERE event_type IN ('browse_category', 'search'))
+SELECT 
+	qtr,
+	ROUND(100*SUM(CASE WHEN event_type = 'home_page' THEN 1 END)/COUNT(*) FILTER(WHERE event_type = 'home_page'),2) AS total_home_page_visit,
+	ROUND(100*SUM(CASE WHEN event_type = 'product_page' THEN 1 END)/SUM(CASE WHEN event_type = 'home_page' THEN 1 END),2) AS visited_prod_page,
+	ROUND(100*SUM(CASE WHEN event_type = 'add_to_cart' THEN 1 END)/SUM(CASE WHEN event_type = 'product_page' THEN 1 END),2) AS added_to_cart
+FROM event_lable AS t1
+JOIN non_rep_customers_events AS t2
+ON t1.session_id = t2.session_id
+WHERE path_type = 'Search'
+GROUP BY 1
+ORDER BY 1;
+
+
+--7) Cart Analysis
+-- i)Expected time of delivery shown in Cart of non_repeat_customers
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+estimated_delivery_time_in_cart AS
+(SELECT t1.qtr,
+COUNT(*) AS total_no_of_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) <=2 THEN 1 END) AS less_than_two_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) =3 THEN 1 END) AS three_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) =4 THEN 1 END) AS four_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) >4 THEN 1 END) AS five_days_and_more
+FROM user_events AS t1
+JOIN non_repeat_customers_by_date AS t2 
+ON t1.user_id = t2.customer_id
+AND t1.qtr = t2.qtr
+AND t1.event_date > t2.order_date
+WHERE estimated_delivery_date IS NOT NULL
+GROUP BY 1)
+SELECT 
+	qtr, 
+	ROUND(100*less_than_two_days/total_no_of_days,2) AS with_in_two_days,
+	ROUND(100*three_days/total_no_of_days,2) AS three_days,
+	ROUND(100*four_days/total_no_of_days,2) AS four_days,
+	ROUND(100*five_days_and_more/total_no_of_days,2) AS five_days_and_more
+FROM 
+	estimated_delivery_time_in_cart;
+
+-- ii) Expected time of delivery shown in Cart of repeat_customers
+WITH repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, MIN(DATE(t2.order_date)) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) > 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id
+GROUP BY 1, 2),
+estimated_delivery_time_in_cart AS
+(SELECT t1.qtr,
+COUNT(*) AS total_no_of_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) <=2 THEN 1 END) AS less_than_two_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) =3 THEN 1 END) AS three_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) =4 THEN 1 END) AS four_days,
+COUNT (CASE WHEN (estimated_delivery_date - DATE(event_date)) >4 THEN 1 END) AS five_days_and_more
+FROM user_events AS t1
+JOIN repeat_customers_by_date AS t2 
+ON t1.user_id = t2.customer_id
+AND t1.qtr = t2.qtr
+AND t1.event_date > t2.order_date
+WHERE estimated_delivery_date IS NOT NULL
+GROUP BY 1)
+SELECT 
+	qtr, 
+	ROUND(100*less_than_two_days/total_no_of_days,2) AS with_in_two_days,
+	ROUND(100*three_days/total_no_of_days,2) AS three_days,
+	ROUND(100*four_days/total_no_of_days,2) AS four_days,
+	ROUND(100*five_days_and_more/total_no_of_days,2) AS five_days_and_more
+FROM 
+	estimated_delivery_time_in_cart;
+	
+
+-- iii) First order delivery time (non_rep_customers)
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, t2.order_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+first_ord_delivery_time AS
+(SELECT
+	t1.qtr,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) <=2 THEN 1 END) AS less_than_two_days,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) =3 THEN 1 END) AS three_days,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) =4 THEN 1 END) AS four_days,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) >4 THEN 1 END) AS five_days_and_more,
+	COUNT(*) AS total_days
+FROM orders AS t1
+JOIN non_repeat_customers_by_date AS t2
+ON t1.order_id = t2.order_id
+GROUP BY 1)
+SELECT 
+	qtr, 
+	ROUND(100*less_than_two_days/total_days,2) AS less_than_two_days,
+	ROUND(100*three_days/total_days,2) AS three_days,
+	ROUND(100*four_days/total_days,2) AS four_days,
+	ROUND(100*five_days_and_more/total_days,2) AS five_days_and_more
+FROM first_ord_delivery_time;
+
+
+-- iv) First order delivery time (rep_customers)
+WITH repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, t2.order_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) > 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+first_ord_delivery_time AS
+(SELECT
+	t1.qtr,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) <=2 THEN 1 END) AS less_than_two_days,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) =3 THEN 1 END) AS three_days,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) =4 THEN 1 END) AS four_days,
+	COUNT(CASE WHEN DATE(delivery_date) - DATE(t1.order_date) >4 THEN 1 END) AS five_days_and_more,
+	COUNT(*) AS total_days
+FROM orders AS t1
+JOIN repeat_customers_by_date AS t2
+ON t1.order_id = t2.order_id
+GROUP BY 1)
+SELECT 
+	qtr, 
+	ROUND(100*less_than_two_days/total_days,2) AS less_than_two_days,
+	ROUND(100*three_days/total_days,2) AS three_days,
+	ROUND(100*four_days/total_days,2) AS four_days,
+	ROUND(100*five_days_and_more/total_days,2) AS five_days_and_more
+FROM first_ord_delivery_time;
+
+-- 8) repeat_and_non_repeat_customer_prime_membership
+WITH base_data AS (
+	SELECT t2.qtr,
+	CASE 
+		WHEN t1.prime_membership = TRUE AND COUNT(DISTINCT DATE(t2.order_date)) > 1 THEN 'Prime_member_(repeat_customer)'
+		WHEN t1.prime_membership = TRUE AND COUNT(DISTINCT DATE(t2.order_date)) = 1 THEN 'Prime_member_(non_repeat_customer)'
+		WHEN t1.prime_membership = FALSE AND COUNT(DISTINCT DATE(t2.order_date)) > 1 THEN 'Non_Prime_member_(repeat_customer)'
+		WHEN t1.prime_membership = FALSE AND COUNT(DISTINCT DATE(t2.order_date)) = 1 THEN 'Non_Prime_member_(non_repeat_customer)'
+	END AS cust_type
+	FROM customers AS t1
+	JOIN orders AS t2 ON t1.customer_id = t2.customer_id
+	WHERE t2.order_status = 'Delivered'
+	GROUP BY 1, t1.customer_id, t1.prime_membership
+)
+SELECT 
+	cust_type,
+	ROUND(100.0 * COUNT(CASE WHEN qtr = 1 THEN 1 END) / SUM(COUNT(CASE WHEN qtr = 1 THEN 1 END)) OVER(), 2) AS q1,
+	ROUND(100.0 * COUNT(CASE WHEN qtr = 2 THEN 1 END) / SUM(COUNT(CASE WHEN qtr = 2 THEN 1 END)) OVER(), 2) AS q2,
+	ROUND(100.0 * COUNT(CASE WHEN qtr = 3 THEN 1 END) / SUM(COUNT(CASE WHEN qtr = 3 THEN 1 END)) OVER(), 2) AS q3
+FROM base_data
+GROUP BY 1
+ORDER BY 1;
+
+-- 9) Age catergory (non_rep_customers)
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, t2.order_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+age_group_tt AS 
+(SELECT t2.*, prime_membership,
+	CASE 
+		WHEN (CURRENT_DATE - dob)/365 <25 THEN '18-24'
+		WHEN (CURRENT_DATE - dob)/365 BETWEEN 25 AND 34 THEN '25-34'
+		WHEN (CURRENT_DATE - dob)/365 BETWEEN 35 AND 44 THEN '35-44'
+		WHEN (CURRENT_DATE - dob)/365 >=45 THEN '45+'
+	END AS age_group
+FROM customers AS t1
+JOIN non_repeat_customers_by_date AS t2
+ON t1.customer_id = t2.customer_id),
+age_group_tt_f AS
+(SELECT 
+	age_group, 
+	COUNT(customer_id) AS total_customers,
+	COUNT(customer_id) FILTER(WHERE prime_membership = TRUE) AS prime_cusotmer,
+	COUNT(customer_id) FILTER(WHERE prime_membership = FALSE) AS non_prime_cusotmer
+FROM 
+	age_group_tt
+GROUP BY 1)
+SELECT 
+	age_group, 
+	ROUND(100.0*total_customers/SUM(total_customers) OVER(),2) AS total_customers,
+	ROUND(100.0*non_prime_cusotmer/total_customers) AS non_prime_cusotmer,
+	ROUND(100.0*prime_cusotmer/total_customers) AS prime_cusotmer
+FROM age_group_tt_f;
+
+-- 10) Product category abanded in the cart
+SELECT * FROM CROSSTAB
+($$
+WITH non_repeat_customers_by_date AS
+(SELECT t1.qtr, t1.customer_id, DATE(t2.order_date) AS order_date
+FROM 
+	(SELECT qtr, customer_id
+	FROM orders
+	WHERE order_status = 'Delivered'
+	GROUP BY 1, 2
+	HAVING COUNT(DISTINCT DATE(order_date)) = 1) AS t1
+JOIN orders AS t2
+ON t1.qtr = t2.qtr
+AND t1.customer_id = t2.customer_id),
+cart_abandment_by_cat AS 
+(SELECT t1.qtr, t3.category, COUNT(t2.order_date) AS total
+FROM user_events AS t1
+JOIN non_repeat_customers_by_date AS t2 
+ON t1.user_id = t2.customer_id
+JOIN products AS t3
+ON t3.product_id = t1.product_id
+AND t1.qtr = t2.qtr
+AND t1.event_date > t2.order_date
+ WHERE t1.event_type = 'add_to_cart'
+GROUP BY 1, 2)
+SELECT category, qtr, ROUND(100*total/sum(total) OVER(PARTITION BY qtr),2)
+FROM cart_abandment_by_cat
+ORDER BY 1, 2
+$$,
+$$SELECT DISTINCT qtr::text FROM orders ORDER BY 1$$
+) AS pivot_result (
+    category  TEXT,
+    q1        NUMERIC,
+    q2        NUMERIC,
+    q3        NUMERIC
+);
+----------------------------------------------------------------------------------------------------------------------------------------
